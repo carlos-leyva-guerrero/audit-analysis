@@ -1,0 +1,7 @@
+.venv/
+output/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+audit_report_executed.ipynb
+input/**/*
