@@ -253,10 +253,43 @@ def compute_op_counts(udf):
 
 def compute_site_cross(udf, top_n=12):
     ct = pd.crosstab(udf["SiteName"], udf["OpCategory"])
+    # Keep a consistent, readable category order and always show Delete (even if zero).
+    if "Delete" not in ct.columns:
+        ct["Delete"] = 0
+    preferred_order = [
+        "Create Folder", "Delete", "Download (Manual)", "Email", "Login", "Login Failed",
+        "Modify", "Other", "Permission Change", "Read / Access", "Rename / Move", "Share",
+        "Sync (Auto)", "Teams / Comms", "Upload",
+    ]
+    ordered_cols = [c for c in preferred_order if c in ct.columns] + [
+        c for c in ct.columns if c not in preferred_order
+    ]
+    ct = ct.reindex(columns=ordered_cols, fill_value=0)
     ct["_Total"] = ct.sum(axis=1)
     ct = ct.sort_values("_Total", ascending=False).head(top_n)
     ct = ct.drop(columns=["_Total"])
     return ct
+
+
+def short_op_label(category):
+    aliases = {
+        "Create Folder": "Create Fld",
+        "Delete": "Delete",
+        "Download (Manual)": "Dl Manual",
+        "Email": "Email",
+        "Login": "Login",
+        "Login Failed": "Login Fail",
+        "Modify": "Modify",
+        "Other": "Other",
+        "Permission Change": "Perm Chg",
+        "Read / Access": "Read/Access",
+        "Rename / Move": "Ren/Move",
+        "Share": "Share",
+        "Sync (Auto)": "Sync Auto",
+        "Teams / Comms": "Teams",
+        "Upload": "Upload",
+    }
+    return aliases.get(category, category[:9])
 
 def compute_daily_timeline(udf):
     return udf.groupby("Date").size()
@@ -481,20 +514,64 @@ class AuditPDF(FPDF):
         """Replace unicode chars that Helvetica can't render."""
         return str(text).replace("\u2014", "-").replace("\u2013", "-").replace("\u2018", "'").replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"').replace("\u2026", "...")
 
-    def add_table(self, headers, rows, col_widths=None):
+    def add_table(self, headers, rows, col_widths=None, vertical_header=False):
         if col_widths is None:
             col_widths = [(self.w - 20) / len(headers)] * len(headers)
+
+        # Keep table inside printable area to avoid clipping on the right edge.
+        usable_w = self.w - self.l_margin - self.r_margin
+        total_w = sum(col_widths)
+        if total_w > usable_w and total_w > 0:
+            scale = usable_w / total_w
+            col_widths = [w * scale for w in col_widths]
+
         self.set_font("Helvetica", "B", 8)
         self.set_fill_color(220, 220, 220)
-        for i, h in enumerate(headers):
-            self.cell(col_widths[i], 6, self.safe_text(h), border=1, fill=True, align="C")
-        self.ln()
+
+        if vertical_header:
+            # Draw compact vertical headers to keep wide tables inside page width.
+            char_h = 2.0
+            max_chars = max(len(self.safe_text(h)) for h in headers)
+            header_h = max(12, min(45, max_chars * char_h + 3))
+            max_chars_fit = max(1, int((header_h - 3) / char_h))
+
+            if self.get_y() + header_h > self.h - 30:
+                self.add_page()
+
+            x0 = self.get_x()
+            y0 = self.get_y()
+
+            for i, h in enumerate(headers):
+                x = x0 + sum(col_widths[:i])
+                w = col_widths[i]
+                label = self.safe_text(h)
+                if len(label) > max_chars_fit:
+                    label = label[:max_chars_fit - 1] + "+"
+
+                self.rect(x, y0, w, header_h, style="DF")
+                text_h = len(label) * char_h
+                y_text = y0 + (header_h - text_h) / 2 + (char_h * 0.8)
+                for ch in label:
+                    ch_w = self.get_string_width(ch)
+                    self.text(x + (w - ch_w) / 2, y_text, ch)
+                    y_text += char_h
+
+            self.set_y(y0 + header_h)
+        else:
+            for i, h in enumerate(headers):
+                self.cell(col_widths[i], 6, self.safe_text(h), border=1, fill=True, align="C")
+            self.ln()
+
         self.set_font("Helvetica", "", 8)
         for row in rows:
             if self.get_y() > self.h - 30:
                 self.add_page()
             for i, val in enumerate(row):
-                self.cell(col_widths[i], 5, self.safe_text(str(val)[:60]), border=1, align="C")
+                max_chars = max(1, int(col_widths[i] / 1.7))
+                txt = self.safe_text(str(val))
+                if len(txt) > max_chars:
+                    txt = txt[:max_chars - 1] + "+"
+                self.cell(col_widths[i], 5, txt, border=1, align="C")
             self.ln()
 
     def safe_cell(self, w, h, txt, **kwargs):
@@ -589,13 +666,25 @@ for user in users:
     pdf.section_title("Operations by Site (Top 12)")
     if has_site_chart:
         pdf.add_image_safe(p_site)
-    cols_site = ["Site"] + list(site_cross.columns)
-    n_extra = len(site_cross.columns)
-    widths = [55] + [max(12, (190 - 55) / max(n_extra, 1))] * n_extra
-    rows_site = []
-    for site, row in site_cross.iterrows():
-        rows_site.append([str(site)[:30]] + [int(v) for v in row.values])
-    pdf.add_table(cols_site, rows_site, widths)
+    site_cols_full = list(site_cross.columns)
+    chunk_size = 7
+    total_chunks = max(1, (len(site_cols_full) + chunk_size - 1) // chunk_size)
+    for chunk_idx, start in enumerate(range(0, len(site_cols_full), chunk_size), start=1):
+        chunk_cols = site_cols_full[start:start + chunk_size]
+        cols_site = ["Site"] + [short_op_label(c) for c in chunk_cols]
+        usable_w = pdf.w - pdf.l_margin - pdf.r_margin
+        site_w = max(48, min(62, usable_w * 0.34))
+        widths = [site_w] + [(usable_w - site_w) / max(len(chunk_cols), 1)] * len(chunk_cols)
+        rows_site = []
+        for site, row in site_cross[chunk_cols].iterrows():
+            rows_site.append([str(site)[:30]] + [int(v) for v in row.values])
+
+        if chunk_idx > 1 and pdf.get_y() > pdf.h - 80:
+            pdf.add_page()
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.cell(0, 5, f"Site Matrix {chunk_idx}/{total_chunks}", new_x="LMARGIN", new_y="NEXT")
+        pdf.add_table(cols_site, rows_site, widths, vertical_header=False)
+        pdf.ln(2)
     pdf.ln(4)
 
     # 4. Daily timeline
@@ -627,7 +716,7 @@ for user in users:
         comp_rows.append([cat, pv, f"{pv_daily:.1f}", lv, f"{lv_daily:.1f}", change])
     pdf.add_table(
         ["Category", "Prior Count", "Prior/Day", "Last 7d Count", "Last 7d/Day", "Change"],
-        comp_rows, [38, 25, 22, 30, 25, 22])
+        comp_rows, [38, 25, 22, 30, 25, 22], vertical_header=False)
     pdf.ln(4)
 
     # 7. Top files in sensitive ops
@@ -680,7 +769,15 @@ for user in users:
     # Save
     safe_name = re.sub(r'[^\w.@-]', '_', user)
     out_path = os.path.join(OUTPUT_DIR, f"audit_report_{safe_name}_{RUN_DATE}.pdf")
-    pdf.output(out_path)
+    try:
+        pdf.output(out_path)
+    except PermissionError:
+        # Common on Windows when the existing PDF is open in a viewer/editor.
+        out_path = os.path.join(
+            OUTPUT_DIR,
+            f"audit_report_{safe_name}_{RUN_DATE}_{datetime.now():%H%M%S}.pdf",
+        )
+        pdf.output(out_path)
     size = os.path.getsize(out_path)
     generated.append((user, out_path, risk_score, len(indicators), size))
     print(f"  -> {out_path}  ({size:,} bytes, risk={risk_score}, {pdf.page_no()} pages)")
